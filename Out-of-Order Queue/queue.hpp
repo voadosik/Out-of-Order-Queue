@@ -55,8 +55,8 @@ public:
 private:
     struct TaskControl;
 
-    mutable std::mutex queue_mutex;
-    std::condition_variable ready_cond;
+    mutable std::mutex mtx;
+    std::condition_variable ready;
     std::queue<std::shared_ptr<TaskControl>> ready_queue;
     size_t sequence_counter = 0;
     size_t unfinished_tasks = 0;
@@ -70,7 +70,7 @@ private:
 struct Queue::TaskControl {
     size_t sequence_number;
     std::function<void()> task;
-    size_t dependency_count = 0;
+    std::atomic<size_t> dependency_count{0};
     std::vector<std::shared_ptr<TaskControl>> dependents;
     bool finished = false;
 
@@ -100,7 +100,7 @@ void Queue::enqueue(Func&& task, WRange&& writes, RRange&& reads) {
 
     std::shared_ptr<TaskControl> tc;
     {
-        std::lock_guard<std::mutex> guard(queue_mutex);
+        std::lock_guard<std::mutex> guard(mtx);
         tc = std::make_shared<TaskControl>(sequence_counter++, std::forward<Func>(task));
         unfinished_tasks++;
 
@@ -147,7 +147,7 @@ void Queue::enqueue(Func&& task, WRange&& writes, RRange&& reads) {
         if (tc->dependency_count == 0) {
             ready_queue.push(tc);
             if (waiting_workers > 0) {
-                ready_cond.notify_one();
+                ready.notify_one();
             }
         }
     }
@@ -158,9 +158,9 @@ void Queue::serve() {
     while (true) {
         std::shared_ptr<TaskControl> tc;
         {
-            std::unique_lock<std::mutex> serve_lock(queue_mutex);
+            std::unique_lock<std::mutex> serve_lock(mtx);
             ++waiting_workers;
-            ready_cond.wait(serve_lock, [this] {
+            ready.wait(serve_lock, [this] {
                 return !ready_queue.empty() || unfinished_tasks == 0;
                 });
             --waiting_workers;
@@ -182,7 +182,7 @@ void Queue::serve() {
             tc->task();
 
         {
-            std::lock_guard<std::mutex> guard(queue_mutex);
+            std::lock_guard<std::mutex> guard(mtx);
             tc->finished = true;
 
             size_t new_ready = 0;
@@ -199,13 +199,15 @@ void Queue::serve() {
             if (new_ready > 0) {
                 size_t to_wake = std::min(new_ready, waiting_workers);
                 for (size_t i = 0; i < to_wake; i++) {
-                    ready_cond.notify_one();
+                    ready.notify_one();
                 }
             }
             else if (unfinished_tasks == 0) {
-                ready_cond.notify_all();
+                ready.notify_all();
             }
         }
+        
+
     }
 }
 
