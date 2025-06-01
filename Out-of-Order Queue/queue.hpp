@@ -14,7 +14,6 @@
 #include <ranges>
 #include <type_traits>
 #include <utility>
-#include <unordered_set>
 
 using resource_id = std::uintptr_t;
 
@@ -44,7 +43,7 @@ public:
     template<std::invocable Func, std::ranges::input_range WRange, std::ranges::input_range RRange>
         requires std::convertible_to<std::ranges::range_value_t<WRange>, resource_id>
     && std::convertible_to<std::ranges::range_value_t<RRange>, resource_id>
-    void enqueue(Func&& task, WRange&& writes, RRange&& reads);
+        void enqueue(Func&& task, WRange&& writes, RRange&& reads);
 
 
     // Makes the current thread a worker thread and starts processing tasks
@@ -54,106 +53,132 @@ public:
     void serve();
 
 private:
-    struct Task;
-
-    void track_dependencies(std::shared_ptr<Task>&);
+    struct TaskControl;
 
     mutable std::mutex mtx;
     std::condition_variable ready;
-    std::queue<std::shared_ptr<Task>> ready_tasks;
-    std::vector<std::shared_ptr<Task>> waiting_tasks;
+    std::queue<std::shared_ptr<TaskControl>> ready_tasks;
+    size_t unfinished_tasks = 0;
+    size_t waiting_workers = 0;
 
-    std::unordered_map<resource_id, int> readers;
-    std::unordered_set<resource_id> writers;
-
-    int executing = 0;
-    std::atomic<bool> off = false;
+    std::unordered_map<resource_id, std::weak_ptr<TaskControl>> last_writer;
+    std::unordered_map<resource_id, std::weak_ptr<TaskControl>> last_task;
 };
 
 
-struct Queue::Task {
+struct Queue::TaskControl {
     std::function<void()> task;
-    std::unordered_set<resource_id> writes;
-    std::unordered_set<resource_id> reads;
-    int pending = 0;
+    std::atomic<size_t> dependency_count{ 0 };
+    std::vector<std::shared_ptr<TaskControl>> dependents;
+    bool finished = false;
+
+    TaskControl(std::function<void()>);
 };
 
-
-void Queue::track_dependencies(std::shared_ptr<Task>& task) {
-    for (resource_id rid : task->writes) 
-        if (writers.count(rid) || readers.count(rid))
-            task->pending++;
-    
-    for (resource_id rid : task->reads)
-        if (writers.count(rid))
-            task->pending++;
+Queue::TaskControl::TaskControl(std::function<void()> t)
+    : task(std::move(t)) {
 }
+
 
 template<std::invocable Func, std::ranges::input_range WRange, std::ranges::input_range RRange>
     requires std::convertible_to<std::ranges::range_value_t<WRange>, resource_id>
 && std::convertible_to<std::ranges::range_value_t<RRange>, resource_id>
 void Queue::enqueue(Func&& task, WRange&& writes, RRange&& reads) {
-    auto t = std::make_shared<Task>();
-    t->task = std::forward<Func>(task);
-    t->writes.insert(std::ranges::begin(writes), std::ranges::end(writes));
-    t->reads.insert(std::ranges::begin(reads), std::ranges::end(reads));
-    
+    std::set<resource_id> write_set;
+    std::set<resource_id> read_set;
+
+    for (auto&& w : writes) write_set.insert(static_cast<resource_id>(w));
+    for (auto&& r : reads) read_set.insert(static_cast<resource_id>(r));
+
+    std::shared_ptr<TaskControl> tc;
     {
         std::lock_guard<std::mutex> guard(mtx);
-        track_dependencies(t);
-        if (t->pending == 0) {
-            ready_tasks.push(t);
-            ready.notify_one();
+        tc = std::make_shared<TaskControl>(std::forward<Func>(task));
+        unfinished_tasks++;
+
+        std::set<std::shared_ptr<TaskControl>> dependencies;
+
+        for (resource_id r : write_set) {
+            if (auto it = last_task.find(r); it != last_task.end()) {
+                if (auto last_task = it->second.lock()) {
+                    if (!last_task->finished) {
+                        dependencies.insert(last_task);
+                    }
+                }
+            }
+
+            last_writer[r] = tc;
+            last_task[r] = tc;
         }
-        else
-            waiting_tasks.push_back(t);
+
+        for (resource_id r : read_set) {
+            if (auto it = last_writer.find(r); it != last_writer.end()) {
+                if (auto last_writer = it->second.lock()) {
+                    if (!last_writer->finished) {
+                        dependencies.insert(last_writer);
+                    }
+                }
+            }
+
+            last_task[r] = tc;
+        }
+
+        tc->dependency_count = dependencies.size();
+        for (auto&& dep : dependencies) dep->dependents.push_back(tc);
+
+        if (tc->dependency_count == 0) {
+            ready_tasks.push(tc);
+            if (waiting_workers > 0) ready.notify_one();
+        }
     }
 }
+
 
 void Queue::serve() {
     while (true) {
-        std::shared_ptr<Task> t;
+        std::shared_ptr<TaskControl> tc;
         {
             std::unique_lock<std::mutex> serve_lock(mtx);
-            ready.wait(serve_lock, [this] {
-                return !ready_tasks.empty() || off;
-                });
+            ++waiting_workers;
+            ready.wait(serve_lock, [this] { return !ready_tasks.empty() || unfinished_tasks == 0; });
+            --waiting_workers;
 
-            if (off && ready_tasks.empty()) return;
-            t = ready_tasks.front();
-            ready_tasks.pop();
-            executing++;
-            for (auto& r : t->writes) writers.insert(r);
-            for (auto& r : t->reads) readers[r]++;
+            if (unfinished_tasks == 0 && ready_tasks.empty()) return;
+
+            if (!ready_tasks.empty()) {
+                tc = ready_tasks.front();
+                ready_tasks.pop();
+            }
+            else continue;
         }
 
-        t->task();
+        tc->task();
 
         {
             std::lock_guard<std::mutex> guard(mtx);
-            for (auto r : t->writes) writers.erase(r);
-            for (auto r : t->reads) if (--readers[r] == 0) readers.erase(r);
+            tc->finished = true;
 
-            --executing;
-            for(auto& t : waiting_tasks)
-                if (t->pending > 0 && --t->pending == 0) {
-                    ready_tasks.push(t);
-                    ready.notify_one();
+            size_t new_ready = 0;
+            for (auto&& dep : tc->dependents) {
+                dep->dependency_count--;
+                if (dep->dependency_count == 0) {
+                    ready_tasks.push(dep);
+                    new_ready++;
                 }
-
-            waiting_tasks.erase(
-                std::remove_if(
-                    waiting_tasks.begin(),
-                    waiting_tasks.end(),
-                    [](const auto& t) { return t->pending == 0; }
-                ), waiting_tasks.end());
-
-            if (executing == 0 && ready_tasks.empty() && waiting_tasks.empty()) {
-                off = true;
-                ready.notify_all();
             }
+            tc->dependents.clear();
+            unfinished_tasks--;
+
+            if (new_ready > 0) 
+                for (size_t i = 0; i < std::min(new_ready, waiting_workers); i++) 
+                    ready.notify_one();
+            else if (unfinished_tasks == 0) 
+                ready.notify_all();
         }
+
+
     }
 }
+
 
 #endif // QUEUE_HPP
